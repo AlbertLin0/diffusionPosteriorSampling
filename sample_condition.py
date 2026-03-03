@@ -3,7 +3,7 @@ import os
 import argparse
 import yaml
 import json
-
+from PIL import Image
 import torch
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
@@ -16,6 +16,7 @@ from data.dataloader import get_dataset, get_dataloader
 from util.img_utils import clear_color, mask_generator
 from util.logger import get_logger
 
+from torchsummary import summary
 
 def load_yaml(file_path: str) -> dict:
     with open(file_path) as f:
@@ -56,6 +57,9 @@ def main():
     model = create_model(**model_config)
     model = model.to(device)
     model.eval()
+    print(model)
+    print(" ---------------------- ")
+    summary(model)
 
     # Prepare Operator and noise
     measure_config = task_config['measurement']
@@ -73,7 +77,7 @@ def main():
     sampler = create_sampler(**diffusion_config, model=model) 
     sample_fn = partial(sampler.p_sample_loop, model=model, measurement_cond_fn=measurement_cond_fn)
     # Working directory
-    out_path = os.path.join(args.save_dir, measure_config['operator']['name'] + "_ddim_test2_scale" + str(task_config['conditioning']['params']['scale']) + "_step" + str(diffusion_config['timestep_respacing']) + "_x0" + str(task_config['conditioning']['params']['noise_step']))
+    out_path = os.path.join(args.save_dir, measure_config['operator']['name'] + "_hypergg18")
     os.makedirs(out_path, exist_ok=True)
     for img_dir in ['input', 'recon', 'progress', 'label']:
         os.makedirs(os.path.join(out_path, img_dir), exist_ok=True)
@@ -93,13 +97,32 @@ def main():
         fname = str(i).zfill(5) + '.png'
         ref_img = ref_img.to(device)
 
-        xt = sampler.q_sample_loop(ref_img)
-        sample = sampler.p_sample_loop(xt, ref_img, measurement_cond_fn=measurement_cond_fn)
-        
-        file_path_label = os.path.join("./results/elic_vtest/", f"label/{str(i).zfill(4)}.png")
-        file_path = os.path.join("./results/elic_vtest/", f"recon/test8_{str(i).zfill(4)}.png")
+        # img_mohu = Image.open('data/test3/test1.png').convert('RGB')
+        # img_mohu = transform(img_mohu)
+        # img_mohu = img_mohu.to(device).unsqueeze(0)
+
+        bpp = operator.getBpp(ref_img) 
+        print(bpp)
+        torch.manual_seed(0)
+        y = operator.forward(ref_img, mode='forward')
+        # y_hat = operator.encode(ref_img)
+        # print(np.sum(clear_color(img_mohu) - clear_co6lor(y)))
+        # print(torch.mean(img_mohu))
+        xt = torch.randn_like(ref_img, device = device)
+        # noise_y = sampler.p_sample_loop(xt, measurement=y, measurement_cond_fn=measurement_cond_fn,truth=ref_img, y=y_hat, operator=operator)
+        # xt = torch.randn_like(ref_img, device = device)
+        # print(noise_y.shape)
+        # print(operator.y_hat_bpp(noise_y))
+        # y = operator.encode(ref_img)
+        # print(operator.y_hat_bpp(y))
+        sample = sampler.dps(xt, measurement=y, measurement_cond_fn=measurement_cond_fn, truth=ref_img)
+        # y = operator.decode(y)
+        file_path_label = os.path.join("./results/gg18_zoo_hypergg18/", f"input/test{str(i).zfill(4)}.png")
+        file_path = os.path.join("./results/gg18_zoo_hypergg18/", f"recon/test{str(i).zfill(4)}.png")
         plt.imsave(file_path, clear_color(sample))
-        plt.imsave(file_path_label, clear_color(ref_img))
+        # print(np.sum(clear_color(img_mohu) - clear_color(y)))
+        plt.imsave(file_path_label, clear_color(y))
+
 
 if __name__ == '__main__':
     main()

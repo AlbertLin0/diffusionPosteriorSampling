@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from util.img_utils import clear_color
 from .posterior_mean_variance import get_mean_processor, get_var_processor
-
+from compressai.entropy_models import EntropyBottleneck
 
 
 __SAMPLER__ = {}
@@ -56,6 +56,18 @@ def create_sampler(sampler,
                    rescale_timesteps=rescale_timesteps,
                    model=model)
 
+class ste_round(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, mode='backward'):
+        if mode == 'forward':
+            return torch.round(x)
+        else:
+            tmp = torch.nn.init.uniform_(torch.zeros_like(x), -0.5, 0.5)
+            return torch.round(x + tmp) - tmp
+
+    @staticmethod
+    def backward(ctx, x_hat_grad):
+        return x_hat_grad.clone()
 
 class GaussianDiffusion:
     def __init__(self,
@@ -121,6 +133,7 @@ class GaussianDiffusion:
         self.var_processor = get_var_processor(model_var_type,
                                                betas=betas)
         self.model = model
+        self.entropybottleneck = EntropyBottleneck(192)
 
     def q_mean_variance(self, x_start, t):
         """
@@ -164,7 +177,7 @@ class GaussianDiffusion:
         coef1 = extract_and_expand(self.sqrt_alphas_cumprod, t+1, x_prev) / extract_and_expand(self.sqrt_alphas_cumprod, t, x_prev)
         coef2 = extract_and_expand(self.sqrt_alphas_cumprod, t+1, x_prev) * ( extract_and_expand(self.sqrt_recipm1_alphas_cumprod, t+1, x_prev) - extract_and_expand(self.sqrt_recipm1_alphas_cumprod, t, x_prev) )
 
-        out = self.p_sample(x_prev, t, flag = 1)
+        out = self.p_sample(x_prev, t+1, flag = 1)
 
         return coef1 * x_prev + coef2 * out["noise"]
 
@@ -245,7 +258,10 @@ class GaussianDiffusion:
     def p_sample_loop(self,
                       x_start,
                       measurement,
-                      measurement_cond_fn):
+                      measurement_cond_fn,
+                      truth,
+                      y,
+                      operator):
                     #   record,
                     #   save_root,
                     #   frame_idx):
@@ -253,39 +269,128 @@ class GaussianDiffusion:
         The function used for sampling from noise.
         """ 
         img = x_start
+        # noise_y is q(x|y)
+        noise_y = torch.tensor(y, device=x_start.device, requires_grad=True)
         device = x_start.device
 
+        # optimizer = torch.optim.Adam([noise_y], lr=0.5, betas=(0.9,0.99), weight_decay=0.0)
+
         pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        distance = torch.tensor(999, device = x_start.device)
         for idx in pbar:
             time = torch.tensor([idx] * img.shape[0], device=device)
-            
+      
             img = img.requires_grad_()
+            noise_y = noise_y.requires_grad_()
             if idx < 0:
-                out = self.p_sample(x=img, t=time, flag=2)
+                out = self.p_sample(x=img, t=time, flag=1)
             else:
                 out = self.p_sample(x=img, t=time)
-            # out = self.p_sample(x=img, t=time)
+            
+            # Give condition.
+            # noisy_measurement = self.q_sample(measurement, t=time)
+            xt_truth = self.q_sample(truth, idx)
+            # TODO: how can we handle argument for different condition method?
+            img, distance, noise_y = measurement_cond_fn(
+                                    x_t=out['sample'],
+                                    measurement=noise_y,
+                                    x_prev=img,
+                                    x_0_hat=out['pred_xstart'],
+                                    coef2 = self.betas[idx]/(self.sqrt_alphas[idx] * self.sqrt_one_minus_alphas_cumprod[idx]),
+                                    noise_coef = out["noise_coef"],
+                                    true_measurement = truth,
+                                    noise = out["noise"],
+                                    sqrt_recip_alphas_cumprod = self.sqrt_recip_alphas_cumprod,
+                                    one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod,
+                                    xt_truth = xt_truth,
+                                    flag = 'forward'
+                                    )
+            
+
+            pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            # if record:
+            if idx % 10 == 0:
+                file_path = os.path.join("results/gg18_zoo_hypergg18/", f"progress/x_{str(idx).zfill(4)}.png")
+                plt.imsave(file_path, clear_color(img))
+
+            # noiseless + absless
+            # norm_noiseless = torch.linalg.norm(img - xt_truth)
+            # # norm_absless = len(self.entropybottleneck.compress(noise_y)[0])
+            # # norm_absless = torch.tensor(norm_absless)
+            # # norm_absless = torch.linalg.norm(self.quantize(noise_y) - y.detach_())
+            # # norm_absless = operator.y_hat_bpp(noise_y)
+            # c1 = 1.0
+            # c2 = 1.0
+            # loss = norm_noiseless# + norm_absless
+            # norm = torch.linalg.norm(loss)
+            # norm_grad = torch.autograd.grad(outputs=norm_noiseless, inputs=noise_y,allow_unused=True)[0]
+            # # optimizer.zero_grad()
+            # # loss.backward()
+            # # optimizer.step()
+            # noise_y -= norm_grad 
+            # noise_y.zero_grad()
+            img = img.detach_()
+            noise_y = noise_y.detach_()
+
+
+        return self.quantize2(noise_y)       
+    
+    def quantize(self, x):
+        return ste_round.apply(x)
+        
+    def quantize2(self, x):
+        return torch.round(x)
+    
+    def dps(self,
+            x_start,
+            measurement,
+            measurement_cond_fn,
+            truth,
+            ):
+            #   record,
+            #   save_root,
+            #   frame_idx):
+        """
+        The function used for sampling from noise.
+        """ 
+        img = x_start
+        device = x_start.device
+        pbar = tqdm(list(range(self.num_timesteps))[::-1])
+        distance = torch.tensor(999, device = x_start.device)
+        for idx in pbar:
+            time = torch.tensor([idx] * img.shape[0], device=device)
+
+            img = img.requires_grad_()
+            if idx < 0:
+                out = self.p_sample(x=img, t=time, flag=1)
+            else:
+                out = self.p_sample(x=img, t=time)
             
             # Give condition.
             # noisy_measurement = self.q_sample(measurement, t=time)
 
             # TODO: how can we handle argument for different condition method?
-            img, distance = measurement_cond_fn(x_t=out['sample'],
-                                      measurement=measurement,
-                                      x_prev=img,
-                                      x_0_hat=out['pred_xstart'],
-                                        )
+            img, distance = measurement_cond_fn(
+                                    x_t=out['sample'],
+                                    measurement=measurement,
+                                    x_prev=img,
+                                    x_0_hat=out['pred_xstart'],
+                                    coef2 = self.betas[idx]/(self.sqrt_alphas[idx] * self.sqrt_one_minus_alphas_cumprod[idx]),
+                                    true_measurement = truth,
+                                    sqrt_recip_alphas_cumprod = self.sqrt_recip_alphas_cumprod,
+                                    one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod,
+                                    flag = 'DPS'
+                                    )
             img = img.detach_()
 
-            # img = out["sample"].clone().detach()
             pbar.set_postfix({'distance': distance.item()}, refresh=False)
             # if record:
-            if idx % 10 == 0:
-                file_path = os.path.join("results/elic_vtest/", f"progress/x_{str(idx).zfill(4)}.png")
-                plt.imsave(file_path, clear_color(img))
+            # if idx % 10 == 0:
+            #     file_path = os.path.join("results/gg18_zoo_hypergg18/", f"progress/x_{str(idx).zfill(4)}.png")
+            #     plt.imsave(file_path, clear_color(img))
 
-        return img       
-        
+        return img 
+         
     def p_sample(self, model, x, t):
         raise NotImplementedError
 
@@ -461,13 +566,7 @@ class DDIM(SpacedDiffusion):
 
         # Equation 12.
         # noise = torch.randn_like(x)
-        if flag == 2:
-            noise = torch.randn((1,3,128,128), device=x.device)
-            noise = torch.repeat_interleave(noise, 2, dim=2)
-            noise = torch.repeat_interleave(noise, 2, dim=3)
-            eta = 0.1
-        else: 
-            noise = torch.randn_like(x)
+        noise = torch.randn_like(x)
 
         out = self.p_mean_variance(x, t)
         eps = self.predict_eps_from_x_start(x, t, out['pred_xstart'])
@@ -488,7 +587,7 @@ class DDIM(SpacedDiffusion):
         if t != 0:
             sample += sigma * noise
         
-        return {"sample": sample, "pred_xstart": out["pred_xstart"], "noise": out["noise"]}
+        return {"sample": sample, "pred_xstart": out["pred_xstart"], "noise_coef": sigma, "noise":out["noise"]}
 
     def predict_eps_from_x_start(self, x_t, t, pred_xstart):
         coef1 = extract_and_expand(self.sqrt_recip_alphas_cumprod, t, x_t)

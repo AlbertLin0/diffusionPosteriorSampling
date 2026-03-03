@@ -38,8 +38,13 @@ class GaussianConditionalNoQuant(GaussianConditional):
 
 class ste_round(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x):
-        return torch.round(x)
+    def forward(ctx, x, mode = "origin"):
+        if mode == "origin":
+            return torch.round(x)
+        elif mode == "same":
+            return x
+        elif mode == "round":
+            return torch.round(x) + torch.nn.init.uniform_(torch.zeros_like(x), -0.5, 0.5)
 
     @staticmethod
     def backward(ctx, x_hat_grad):
@@ -65,16 +70,17 @@ cvt = {
 class ScaleHyperpriorSTE(ScaleHyperprior):
     def __init__(self, N, M, **kwargs):
         super().__init__(N, M, **kwargs)
-        self.entropy_bottleneck = EntropyBottleneckNoQuant(N)
-        self.gaussian_conditional = GaussianConditionalNoQuant(None)
+        # self.entropy_bottleneck = EntropyBottleneckNoQuant(N)
+        # self.gaussian_conditional = GaussianConditionalNoQuant(None)
 
-    def quantize(self, inputs, mode):
+    def quantize(self, inputs):
         return ste_round.apply(inputs)
 
     def forward(self, x, mode="all"):
         y = self.g_a(x)
         z = self.h_a(torch.abs(y))
-        y_hat = self.quantize(y, "round")
+        y_hat = self.quantize(y, "origin")
+        y_hat = y
         if mode == "enc":
             return { 
                 "y_hat": y_hat
@@ -85,9 +91,9 @@ class ScaleHyperpriorSTE(ScaleHyperprior):
         y_likelihoods = self.gaussian_conditional(y_hat, scales_hat, None)
         x_hat = self.g_s(y_hat)
         return {
-            "x_bar": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-        }
+            "x_hat": x_hat,}
+        #     "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+        # }
     def load_state_dict_gg18(self, sd):
         sdkeys = list(sd.keys())
         for key in sdkeys:
